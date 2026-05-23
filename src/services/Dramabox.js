@@ -1,7 +1,9 @@
 import axios from "axios";
 import NodeCache from "node-cache";
+import { ProxyAgent } from "proxy-agent";
 import DramaboxUtil from "../utils/DramaboxUtil.js";
 import { config } from "../config/config.js";
+import { getRandomProxy } from "../utils/proxyManager.js";
 
 // ============================================
 // CONFIGURATION
@@ -46,10 +48,10 @@ const cache = new NodeCache({
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const getRetryDelay = (attempt) => {
-  const delay =
+  const retryDelay =
     CONFIG.INITIAL_RETRY_DELAY *
     Math.pow(CONFIG.RETRY_BACKOFF_MULTIPLIER, attempt);
-  return Math.min(delay, CONFIG.MAX_RETRY_DELAY);
+  return Math.min(retryDelay, CONFIG.MAX_RETRY_DELAY);
 };
 
 const isRetryableError = (error) => {
@@ -114,6 +116,7 @@ export default class Dramabox {
   baseUrl_Dramabox = "https://sapi.dramaboxdb.com";
   webficUrl = "https://www.webfic.com";
   tokenCache = null;
+  tokenGenerationPromise = null; // mutex: prevents parallel token stampede
   http;
   lang;
   instanceId;
@@ -204,13 +207,30 @@ export default class Dramabox {
 
       const url = `${this.baseUrl_Dramabox}/drama-box/ap001/bootstrap?timestamp=${timestamp}`;
 
+      // --- PROXY SUPPORT ---
+      // Route the bootstrap request through a residential proxy so Vercel's
+      // AWS datacenter IP is never seen by sapi.dramaboxdb.com.
+      const axiosConfig = {
+        headers,
+        timeout: CONFIG.TOKEN_TIMEOUT,
+      };
+
+      const proxy = getRandomProxy();
+      if (proxy) {
+        console.log(`[Token] Using proxy: ${proxy}`);
+        axiosConfig.httpsAgent = new ProxyAgent(proxy);
+        axiosConfig.proxy = false; // tell axios not to use its own proxy handling
+      } else {
+        console.warn(
+          "[Token] ⚠️  No proxy available — request will use Vercel IP (may be blocked)"
+        );
+      }
+      // --- END PROXY SUPPORT ---
+
       const res = await axios.post(
         url,
         { distinctId: null },
-        {
-          headers,
-          timeout: CONFIG.TOKEN_TIMEOUT,
-        }
+        axiosConfig
       );
 
       if (!res.data?.data?.user) {
@@ -257,7 +277,19 @@ export default class Dramabox {
     if (this.isTokenValid()) {
       return this.tokenCache;
     }
-    return this.generateNewToken();
+
+    // Mutex: if a token generation is already in-flight, wait for it
+    // instead of firing a parallel request (prevents the 4× stampede).
+    if (this.tokenGenerationPromise) {
+      console.log(`[Token] Waiting for in-flight token generation...`);
+      return this.tokenGenerationPromise;
+    }
+
+    this.tokenGenerationPromise = this.generateNewToken().finally(() => {
+      this.tokenGenerationPromise = null;
+    });
+
+    return this.tokenGenerationPromise;
   }
 
   // ============================================
@@ -318,7 +350,7 @@ export default class Dramabox {
         );
       }
 
-      const config = {
+      const requestConfig = {
         method: method.toUpperCase(),
         url,
         headers,
@@ -326,7 +358,7 @@ export default class Dramabox {
         data: method.toUpperCase() !== "GET" ? payload : undefined,
       };
 
-      const response = await this.http.request(config);
+      const response = await this.http.request(requestConfig);
 
       // Check for API-level failures
       if (!isWebfic && response.data && response.data.success === false) {
